@@ -19,7 +19,7 @@ This is a standalone markdown document that any AI (or human) can use.
 > **Topic**: [e.g., SEO, Email Marketing]
 > **Audience**: [Beginners / Intermediate / Advanced / All]
 > **Sources**: [N] sources processed, [N] claims verified
-> **Generated**: [Date] by SkillForge
+> **Generated**: [Date] by FireSkill
 > **Confidence**: [X]% HIGH, [X]% MEDIUM, [X]% LOW
 > **Refresh by**: [Date — typically 6-12 months after generation]
 
@@ -132,7 +132,7 @@ ELSE → Default to WebP
 
 ### Directory Structure:
 ```
-skillforge-generated/
+FireSkill-generated/
 ├── SKILL.md              # Main skill file with YAML frontmatter
 ├── references/
 │   ├── source_citations.md
@@ -344,7 +344,7 @@ Always generate this alongside the skill:
 
 ```json
 {
-  "skillforge_version": "1.0.0",
+  "FireSkill_version": "1.0.0",
   "skill_name": "[name]",
   "topic": "[topic]",
   "audience": "[target audience]",

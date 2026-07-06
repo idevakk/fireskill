@@ -1,7 +1,7 @@
-# Sample Prompts — How to Use SkillForge
+# Sample Prompts — How to Use FireSkill
 
 ## Overview
-These are example prompts a user can give to an AI agent that has SkillForge installed.
+These are example prompts a user can give to an AI agent that has FireSkill installed.
 Each example shows the user's prompt and what the expected behavior should be.
 
 ---
@@ -10,7 +10,7 @@ Each example shows the user's prompt and what the expected behavior should be.
 
 **User Prompt:**
 ```
-Use the SkillForge skill to build an SEO skill from these sources:
+Use the FireSkill skill to build an SEO skill from these sources:
 - https://developers.google.com/search/docs
 - https://www.youtube.com/watch?v=abc123 (Ahrefs SEO tutorial)
 - https://www.youtube.com/shorts/def456 (Quick SEO tip)
@@ -23,7 +23,7 @@ Output format: Gemini + Claude
 ```
 
 **Expected Agent Behavior:**
-1. Reads SKILL.md → loads the SkillForge workflow
+1. Reads SKILL.md → loads the FireSkill workflow
 2. Reads extraction_protocol.md → knows how to handle each source type
 3. Extracts content from all 6 sources using Firecrawl (with fallbacks)
 4. Reads authentication_framework.md → cross-references claims
@@ -39,7 +39,7 @@ Output format: Gemini + Claude
 
 **User Prompt:**
 ```
-SkillForge: Build me an email marketing skill.
+FireSkill: Build me an email marketing skill.
 Sources:
 - https://mailchimp.com/resources/email-marketing-guide/
 - https://www.youtube.com/watch?v=email123 (Email expert tutorial)
@@ -60,7 +60,7 @@ Output for all agents.
 
 **User Prompt:**
 ```
-Use SkillForge with these links:
+Use FireSkill with these links:
 - https://react.dev/learn
 - https://www.youtube.com/watch?v=react123
 ```
@@ -77,7 +77,7 @@ Use SkillForge with these links:
 
 **User Prompt:**
 ```
-SkillForge: Build a skill from this video: https://www.youtube.com/watch?v=solo123
+FireSkill: Build a skill from this video: https://www.youtube.com/watch?v=solo123
 ```
 
 **Expected Agent Behavior:**
@@ -93,7 +93,7 @@ SkillForge: Build a skill from this video: https://www.youtube.com/watch?v=solo1
 
 **User Prompt:**
 ```
-SkillForge: I want an advanced TypeScript skill for senior developers.
+FireSkill: I want an advanced TypeScript skill for senior developers.
 Sources:
 - https://www.typescriptlang.org/docs/
 - https://www.youtube.com/watch?v=ts-advanced
@@ -117,16 +117,16 @@ Skip beginner content. Only include advanced patterns.
 ```
 "Summarize these articles for me"
 ```
-→ SkillForge should NOT activate. This is summarization, not skill building.
+→ FireSkill should NOT activate. This is summarization, not skill building.
 
 ### Bad: Single webpage read
 ```
 "Read this webpage and tell me what it says"
 ```
-→ SkillForge should NOT activate. This is simple content reading.
+→ FireSkill should NOT activate. This is simple content reading.
 
 ### Bad: No sources provided
 ```
 "Build me an SEO skill"
 ```
-→ SkillForge should ask for sources before proceeding. It MUST NOT generate a skill from its own training data alone.
+→ FireSkill should ask for sources before proceeding. It MUST NOT generate a skill from its own training data alone.

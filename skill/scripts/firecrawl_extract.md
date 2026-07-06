@@ -1,7 +1,7 @@
 # Firecrawl Extraction Patterns
 
 ## Overview
-SkillForge uses the **Firecrawl Cloud API** for web content extraction. This document
+FireSkill uses the **Firecrawl Cloud API** for web content extraction. This document
 provides the agent with patterns for using Firecrawl effectively.
 
 ---

@@ -1,5 +1,5 @@
 {
-  "name": "skillforge",
+  "name": "fireskill",
   "version": "1.0.0",
   "description": "AI-powered meta-skill that extracts genuine knowledge from multiple sources and builds production-ready agent skills for any AI platform.",
   "keywords": [
@@ -7,23 +7,23 @@
     "agent-skills",
     "knowledge-extraction",
     "skill-builder",
+    "fireskill",
     "claude",
     "gemini",
     "cursor",
     "windsurf",
-    "openai"
+    "openai",
+    "firecrawl"
   ],
-  "author": "",
+  "author": "idevak",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "skillforge": "./bin/cli.js"
+    "fireskill": "./bin/cli.js"
   },
   "files": [
     "bin/",
     "skill/",
-    "templates/",
-    "scripts/",
     "README.md",
     "LICENSE"
   ],
@@ -39,6 +39,7 @@
     "chalk": "^5.3.0",
     "inquirer": "^9.2.0",
     "fs-extra": "^11.2.0",
-    "ora": "^8.0.1"
+    "ora": "^8.0.1",
+    "tar": "^7.4.0"
   }
 }

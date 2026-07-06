@@ -1,8 +1,10 @@
-# ⚒️ SkillForge
+# 🔥 FireSkill
 
 **Transform scattered knowledge into production-ready AI agent skills.**
 
-SkillForge is a meta-skill that extracts genuine expertise from multiple sources (websites, YouTube videos, Instagram posts, documentation), authenticates every claim through cross-referencing and verification, and produces a polished, production-ready AI agent skill — complete with confidence scoring and source citations.
+FireSkill is a meta-skill that extracts genuine expertise from multiple sources (websites, YouTube videos, Instagram posts, documentation), authenticates every claim through cross-referencing and verification, and produces a polished, production-ready AI agent skill — complete with confidence scoring and source citations.
+
+**Also a universal skill installer** — install any AI skill from GitHub into any agent with one command.
 
 ---
 
@@ -30,44 +32,71 @@ SkillForge is a meta-skill that extracts genuine expertise from multiple sources
 
 ## 📦 Installation
 
-### Quick Install (npx)
-```bash
-npx skillforge install
-```
-
-This launches an interactive installer that lets you choose:
-- Which AI agents to install for
-- Whether to install globally or project-locally
-
-### Install for Specific Agent
-```bash
-npx skillforge install --agent gemini --global
-npx skillforge install --agent claude
-npx skillforge install --agent all --global
-```
-
-### Manual Install
-Clone this repo and copy the `skill/` directory to your agent's skill location:
+### Install FireSkill's Built-in Meta-Skill
 
 ```bash
-# For Gemini/Antigravity (global)
-cp -r skill/ ~/.gemini/config/skills/skillforge/
+# Interactive (choose agents + global/local)
+npx fireskill install
 
-# For Claude Code (project)
-cp -r skill/ .claude/skills/skillforge/
+# Specific agent, globally
+npx fireskill install --agent gemini --global
 
-# For Cursor (project)
-cp -r skill/ .cursor/skills/skillforge/
+# All agents, locally
+npx fireskill install --agent all
 ```
+
+### Install Any Skill from GitHub
+
+```bash
+# Install a skill from any GitHub repo
+npx fireskill add owner/repo-name
+
+# Install for a specific agent
+npx fireskill add owner/repo-name --agent claude --global
+
+# Install from a specific branch
+npx fireskill add owner/repo-name#dev
+
+# Install for all agents globally
+npx fireskill add owner/repo-name --agent all --global
+```
+
+The `add` command:
+1. Downloads the repo tarball from GitHub
+2. Finds the `skill/` directory (or `SKILL.md` at root)
+3. Reads the skill name from SKILL.md frontmatter
+4. Copies it to the correct location for your chosen agent(s)
+
+> **Private repos**: Set `GITHUB_TOKEN` or `GH_TOKEN` environment variable.
 
 ---
 
-## 🚀 Usage
+## 🔧 All Commands
 
-After installation, tell your AI agent:
+| Command | Description |
+|---------|-------------|
+| `npx fireskill install` | Install FireSkill's built-in meta-skill |
+| `npx fireskill add owner/repo` | Install any skill from GitHub |
+| `npx fireskill remove skill-name` | Remove an installed skill by name |
+| `npx fireskill uninstall` | Remove FireSkill's built-in meta-skill |
+| `npx fireskill list` | List all installed skills |
+
+### Command Options
+
+| Flag | Description |
+|------|-------------|
+| `-g, --global` | Install/remove from global config (all projects) |
+| `-a, --agent <name>` | Target agent: `gemini`, `claude`, `cursor`, `windsurf`, `openai`, `all` |
+| `-n, --name <name>` | Override skill name (for `add` command) |
+
+---
+
+## 🚀 Usage (After Installing the Meta-Skill)
+
+Tell your AI agent:
 
 ```
-Use the SkillForge skill to build a [TOPIC] skill from these sources:
+Use the FireSkill skill to build a [TOPIC] skill from these sources:
 - https://example.com/article
 - https://www.youtube.com/watch?v=VIDEO_ID
 - https://www.instagram.com/p/POST_ID/
@@ -79,7 +108,7 @@ Output format: [gemini / claude / cursor / windsurf / openai / all / universal]
 
 ### Example
 ```
-Use SkillForge to build an SEO skill from these sources:
+Use FireSkill to build an SEO skill from these sources:
 - https://developers.google.com/search/docs
 - https://www.youtube.com/watch?v=abc123
 - https://moz.com/beginners-guide-to-seo
@@ -93,7 +122,7 @@ Format: Gemini + Claude
 
 ## 📁 What Gets Generated
 
-SkillForge produces a complete skill directory:
+FireSkill produces a complete skill directory:
 
 ```
 generated-skill/
@@ -136,41 +165,77 @@ Only HIGH and MEDIUM claims make it into the final skill. LOW claims are include
 
 ---
 
+## 📝 Making Your Own Skill Installable via FireSkill
+
+Want others to install YOUR skill with `npx fireskill add your-name/your-repo`?
+
+Structure your repo like this:
+
+```
+your-repo/
+├── skill/
+│   ├── SKILL.md          # Required — must have name in YAML frontmatter
+│   ├── references/       # Optional — supporting documentation
+│   ├── examples/         # Optional — usage examples
+│   └── scripts/          # Optional — helper scripts
+├── README.md
+└── ...
+```
+
+The only requirement is a `SKILL.md` with YAML frontmatter containing a `name` field:
+
+```yaml
+---
+name: my-awesome-skill
+description: What this skill does and when to use it
+---
+```
+
+FireSkill will find it automatically in `skill/`, `skills/`, `.skill/`, or the repo root.
+
+---
+
 ## 🔧 Prerequisites
 
-- **Firecrawl API Key**: SkillForge uses [Firecrawl](https://firecrawl.dev) for web content extraction
+- **Node.js 18+**: Required for the CLI
+- **Firecrawl API Key** (optional): For the meta-skill's content extraction
   - Set as environment variable: `FIRECRAWL_API_KEY`
-  - Falls back to built-in tools if Firecrawl is unavailable
-- **Node.js 18+**: Required for the CLI installer
+  - Falls back to built-in tools if unavailable
 
 ---
 
 ## 🗑️ Uninstall
 
 ```bash
-npx skillforge uninstall
-```
+# Remove FireSkill's built-in meta-skill
+npx fireskill uninstall
 
-Or manually delete the `skillforge/` directory from your agent's skills folder.
+# Remove a specific installed skill
+npx fireskill remove skill-name
+```
 
 ---
 
-## 📋 Skill Structure
-
-SkillForge itself is structured as:
+## 📋 Project Structure
 
 ```
-skill/
-├── SKILL.md                          # Core meta-skill instructions
-├── references/
-│   ├── extraction_protocol.md        # How to extract from each source type
-│   ├── authentication_framework.md   # How to verify and score claims
-│   └── output_formats.md            # Templates for each agent format
-├── examples/
-│   ├── seo_skill_example.md         # Sample generated skill
-│   └── sample_prompts.md            # Example usage prompts
-└── scripts/
-    └── firecrawl_extract.md         # Firecrawl-specific patterns
+fireskill/
+├── bin/
+│   └── cli.js                          # CLI with install/add/remove/list
+├── skill/
+│   ├── SKILL.md                        # Core meta-skill instructions
+│   ├── references/
+│   │   ├── extraction_protocol.md      # Source extraction patterns
+│   │   ├── authentication_framework.md # Verification & scoring
+│   │   └── output_formats.md           # Agent format templates
+│   ├── examples/
+│   │   ├── seo_skill_example.md        # Sample generated skill
+│   │   └── sample_prompts.md           # Example usage prompts
+│   └── scripts/
+│       └── firecrawl_extract.md        # Firecrawl patterns
+├── package.json
+├── README.md
+└── LICENSE
 ```
 
 ---

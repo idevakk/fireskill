@@ -1,5 +1,5 @@
 ---
-name: skillforge
+name: fireskill
 description: >
   Meta-skill that builds production-ready AI agent skills from multiple knowledge sources.
   Use when the user provides URLs (websites, YouTube videos, Instagram posts, Shorts, articles, docs)
@@ -9,7 +9,7 @@ description: >
   or when the user just wants to read a single webpage.
 ---
 
-# SkillForge — Knowledge-to-Skill Builder
+# FireSkill — Knowledge-to-Skill Builder
 
 ## Purpose
 You are a **knowledge distillation engine**. Given multiple source links, you extract genuine expertise,
