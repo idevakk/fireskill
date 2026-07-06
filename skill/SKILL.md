@@ -39,6 +39,7 @@ Ask the user for:
 - The **topic/domain** for the skill (e.g., "SEO", "Email Marketing", "React Performance")
 - The **target audience** (beginners, intermediate, advanced, or all)
 - Which **agent formats** to generate (gemini, claude, cursor, windsurf, openai, universal) — default: universal
+- **Firecrawl Dependency**: Ask the user whether to depend on the `firecrawl` skill (if installed on their agent) for browsing, transcription, and scraping needs in the generated skill.
 
 **Step 1.2 — Validate Source List**
 - Confirm you have at least 2 sources (more is better for cross-referencing)
@@ -163,10 +164,10 @@ Based on user's selection (or default "universal"), generate:
 
 **Step 5.2 — Generate the Skill Structure**
 
-For each selected format, create the complete skill directory:
+For each selected format, create the complete skill directory in `.agents/skills/{skill-name}/`:
 
 ```
-generated-skill/
+.agents/skills/{skill-name}/
 ├── SKILL.md                    # Core skill (Gemini format)
 ├── CLAUDE.md                   # Claude format (if selected)
 ├── .cursorrules                # Cursor format (if selected)
@@ -197,6 +198,7 @@ The generated skill MUST include these sections:
 8. **Source Citations** — Every claim linked to its source(s)
 9. **Confidence Notes** — Where the skill is highly confident vs. where advice is experimental
 10. **Update Notes** — When this skill was built, from which sources, and when it should be refreshed
+11. **Dependencies (Optional)** — If the user agreed in Step 1.1, add instructions explicitly telling the agent to use the `firecrawl` skill for all web search, page scraping, and video transcript extraction needs. **Crucially, include a fallback:** "If the `firecrawl` skill is not installed, fallback to native browsing/search tools, or instruct the user to install it by running `npx -y firecrawl-cli@latest init --all --browser`."
 
 **Step 5.4 — Quality Check**
 Before presenting to user, verify:
@@ -220,7 +222,7 @@ Show the user:
 - List of rejected claims (brief)
 
 **Step 6.2 — Write Files**
-Write all generated skill files to the user's specified directory or the project workspace.
+Write all generated skill files to the `.agents/skills/{skill-name}/` directory in the user's project workspace.
 
 **Step 6.3 — Suggest Next Steps**
 - "Review the `references/confidence_report.md` for detailed scoring"

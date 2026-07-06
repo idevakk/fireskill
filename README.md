@@ -125,7 +125,7 @@ Format: Gemini + Claude
 FireSkill produces a complete skill directory:
 
 ```
-generated-skill/
+.agents/skills/{skill-name}/
 ├── SKILL.md                    # Core skill (Gemini format)
 ├── CLAUDE.md                   # Claude format
 ├── .cursorrules                # Cursor format

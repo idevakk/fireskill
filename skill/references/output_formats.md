@@ -132,7 +132,7 @@ ELSE → Default to WebP
 
 ### Directory Structure:
 ```
-FireSkill-generated/
+.agents/skills/{skill-name}/
 ├── SKILL.md              # Main skill file with YAML frontmatter
 ├── references/
 │   ├── source_citations.md
