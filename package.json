@@ -1,6 +1,6 @@
 {
   "name": "fireskill",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "AI-powered meta-skill that extracts genuine knowledge from multiple sources and builds production-ready agent skills for any AI platform.",
   "keywords": [
     "ai-skills",
