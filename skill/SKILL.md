@@ -198,7 +198,7 @@ The generated skill MUST include these sections:
 8. **Source Citations** — Every claim linked to its source(s)
 9. **Confidence Notes** — Where the skill is highly confident vs. where advice is experimental
 10. **Update Notes** — When this skill was built, from which sources, and when it should be refreshed
-11. **Dependencies (Optional)** — If the user agreed in Step 1.1, add instructions explicitly telling the agent to use the `firecrawl` skill for all web search, page scraping, and video transcript extraction needs. **Crucially, include a fallback:** "If the `firecrawl` skill is not installed, fallback to native browsing/search tools, or instruct the user to install it by running `npx -y firecrawl-cli@latest init --all --browser`."
+11. **Dependencies (Optional)** — If the user agreed in Step 1.1, add instructions explicitly telling the agent to use the `firecrawl` skill for all web search, page scraping, and video transcript extraction needs. **Crucially, include a fallback:** "If the `firecrawl` skill is not installed or the user prefers free/open-source alternatives, fallback to the agent's native tools (e.g., `search_web`, `read_url`, `browser_subagent`) or use free utilities like Jina Reader (`https://r.jina.ai/[URL]`) for markdown extraction, and `yt-dlp` for YouTube transcripts."
 
 **Step 5.4 — Quality Check**
 Before presenting to user, verify:
