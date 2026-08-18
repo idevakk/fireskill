@@ -18,12 +18,12 @@ import inquirer from 'inquirer';
 import chalk from 'chalk';
 import fs from 'fs-extra';
 import path from 'path';
-import { fileURLToPath } from 'url';
-import { execSync } from 'child_process';
+import { fileURLToPath, pathToFileURL } from 'url';
 import ora from 'ora';
 import https from 'https';
 import { createGunzip } from 'zlib';
 import { pipeline } from 'stream/promises';
+import { Readable, Transform } from 'stream';
 import { extract as tarExtract } from 'tar';
 import os from 'os';
 
@@ -65,84 +65,490 @@ function getHomedir() {
   return process.env.HOME || process.env.USERPROFILE || os.homedir();
 }
 
-// ─── GitHub Utilities ──────────────────────────────────────────────────────────
+// ─── GitHub Security Policy ────────────────────────────────────────────────────
+// Defense in depth: these limits are enforced on top of what the `tar` package
+// does by default. Never rely on upstream guarantees alone.
 
-/**
- * Parse a GitHub identifier like "owner/repo" or "owner/repo#branch"
- */
-function parseGitHubId(id) {
-  const match = id.match(/^([^/]+)\/([^#]+)(?:#(.+))?$/);
-  if (!match) return null;
-  return { owner: match[1], repo: match[2], branch: match[3] || 'main' };
+// Only GitHub-owned hosts may be contacted while downloading. The token is
+// attached exclusively to requests whose hostname is in this allowlist.
+const ALLOWED_DOWNLOAD_HOSTS = new Set([
+  'github.com',
+  'api.github.com',
+  'codeload.github.com',
+  'objects.githubusercontent.com',
+  'raw.githubusercontent.com',
+]);
+
+const MAX_REDIRECTS = 5;
+const MAX_ARCHIVE_ENTRIES = 100000; // 100k files is far beyond any sane skill repo
+const MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024; // 1 GiB uncompressed tarball cap
+const MAX_FRONTMATTER_BYTES = 64 * 1024; // SKILL.md frontmatter read cap
+const MAX_SKILL_NAME_LENGTH = 100;
+const GITHUB_COMPONENT_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*)$/;
+const GITHUB_BRANCH_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._/-]*)$/;
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/;
+
+function isAllowedDownloadHost(hostname) {
+  return typeof hostname === 'string' && ALLOWED_DOWNLOAD_HOSTS.has(hostname.toLowerCase());
 }
 
 /**
- * Download and extract a GitHub repo tarball to a temp directory.
- * Returns the path to the extracted content.
+ * Resolve a redirect location against the current URL.
+ * Returns the next URL string, or null if the redirect is not safe
+ * (non-https, off-allowlist host, embedded credentials).
  */
-async function downloadGitHubRepo(owner, repo, branch) {
-  const url = `https://api.github.com/repos/${owner}/${repo}/tarball/${branch}`;
-  const tmpDir = path.join(os.tmpdir(), `fireskill-${owner}-${repo}-${Date.now()}`);
-  await fs.ensureDir(tmpDir);
+function resolveRedirectUrl(currentUrl, location) {
+  try {
+    const next = new URL(location, new URL(currentUrl));
+    if ((next.protocol || '') !== 'https:') return null;
+    if (!isAllowedDownloadHost(next.hostname)) return null;
+    if (next.username || next.password) return null;
+    return next.href;
+  } catch {
+    return null;
+  }
+}
 
+/**
+ * Build request options for a download URL.
+ * The Authorization header is only ever attached to allowlisted GitHub hosts.
+ */
+function buildRequestOptions(urlStr, token) {
+  const u = new URL(urlStr);
+  const headers = {
+    'User-Agent': 'fireskill-cli',
+    'Accept': 'application/vnd.github+json',
+  };
+  if (token && isAllowedDownloadHost(u.hostname)) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  return { hostname: u.hostname, path: u.pathname + u.search, headers };
+}
+
+// ─── GitHub Utilities ──────────────────────────────────────────────────────────
+
+/**
+ * Parse a GitHub identifier like "owner/repo" or "owner/repo#branch".
+ * Every component is anchored to the GitHub-allowed charset and length;
+ * anything else is rejected outright.
+ */
+function parseGitHubId(id) {
+  if (typeof id !== 'string' || id.length === 0 || id.length > 200) return null;
+  const match = id.match(/^([^/]+)\/([^#]+?)(?:#(.+))?$/);
+  if (!match) return null;
+
+  const owner = match[1];
+  const repo = match[2];
+  const branch = match[3] || 'main';
+
+  if (!isValidGitHubComponent(owner, 64)) return null;
+  if (!isValidGitHubComponent(repo, 100)) return null;
+  if (!isValidGitHubBranch(branch)) return null;
+
+  return { owner, repo, branch };
+}
+
+function isValidGitHubComponent(s, maxLen) {
+  if (typeof s !== 'string' || s.length === 0 || s.length > maxLen) return false;
+  if (s === '.' || s === '..' || s.includes('..')) return false;
+  return GITHUB_COMPONENT_RE.test(s);
+}
+
+function isValidGitHubBranch(b) {
+  if (typeof b !== 'string' || b.length === 0 || b.length > 100) return false;
+  if (b === '.' || b === '..' || b.includes('..') || b.includes('//')) return false;
+  if (!GITHUB_BRANCH_RE.test(b)) return false;
+  for (const segment of b.split('/')) {
+    if (segment === '.' || segment === '..') return false;
+  }
+  return true;
+}
+
+// ─── Secure temp directory ─────────────────────────────────────────────────────
+
+/**
+ * Create an unpredictable, mode-restricted temp directory via mkdtemp.
+ * Never use a predictable name under os.tmpdir(): a local attacker could
+ * pre-create it as a symlink and redirect writes.
+ */
+async function createSecureTempDir(prefix = 'fireskill-') {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  await fs.chmod(dir, 0o700); // explicit regardless of umask
+  return dir;
+}
+
+// ─── Tar extraction with layered validation ────────────────────────────────────
+
+function createByteLimitTransform(limit) {
+  let total = 0;
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      total += chunk.length;
+      if (total > limit) {
+        cb(Object.assign(new Error(`Archive exceeds the ${limit}-byte download limit`), {
+          code: 'ERR_ARCHIVE_TOO_LARGE',
+        }));
+        return;
+      }
+      cb(null, chunk);
+    },
+  });
+}
+
+/**
+ * Gunzip the stream only when it is actually gzipped (magic bytes 0x1f 0x8b);
+ * otherwise pass it through untouched. GitHub serves gzipped tarballs, but
+ * this also tolerates plain tar streams and makes extraction testable with
+ * locally crafted archives.
+ */
+function createAutoGunzip() {
+  let gunzip = null;
+  let decided = false;
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      if (!decided) {
+        decided = true;
+        if (chunk.length >= 2 && chunk[0] === 0x1f && chunk[1] === 0x8b) {
+          gunzip = createGunzip();
+          gunzip.on('data', (d) => this.push(d));
+          gunzip.on('error', (e) => this.destroy(e));
+        }
+      }
+      if (gunzip) {
+        gunzip.write(chunk, cb);
+      } else {
+        cb(null, chunk);
+      }
+    },
+    flush(cb) {
+      if (gunzip) {
+        gunzip.end();
+        gunzip.on('end', () => cb());
+      } else {
+        cb();
+      }
+    },
+  });
+}
+
+/**
+ * Extract a gzip tarball stream into destRoot and then verify the result.
+ * Safety layers (each independently sufficient, all applied):
+ *  1. node-tar with `strict: true`: any entry with `..`, absolute paths,
+ *     extraction-through-symlink, or depth > 1024 aborts extraction.
+ *     (Do NOT use tar's `filter`/`files` options: they carry their own
+ *     recursion DoS advisory, GHSA-r292-9mhp-454m.)
+ *  2. `preservePaths: false` (explicit default): absolute paths and `..`
+ *     are never honored.
+ *  3. Entry-count cap enforced via the extractor's `entry` events.
+ *  4. Uncompressed byte cap via a counting transform.
+ *  5. Post-extraction walk (`assertRepoContained`): independent verification
+ *     that nothing on disk resolves outside destRoot.
+ */
+async function extractAndValidateArchive(source, destRoot, opts = {}) {
+  const maxEntries = opts.maxEntries ?? MAX_ARCHIVE_ENTRIES;
+  const maxBytes = opts.maxBytes ?? MAX_ARCHIVE_BYTES;
+
+  const extractor = tarExtract({
+    cwd: destRoot,
+    strip: 1, // mirror the previous behavior: drop the archive's top directory
+    strict: true,
+    preservePaths: false,
+  });
+
+  let entryCount = 0;
+  extractor.on('entry', () => {
+    entryCount += 1;
+    if (entryCount > maxEntries) {
+      // Minipass-based tar streams expose abort() rather than destroy().
+      extractor.abort(Object.assign(new Error(`Archive contains more than ${maxEntries} entries`), {
+        code: 'ERR_ARCHIVE_TOO_MANY_ENTRIES',
+      }));
+    }
+  });
+
+  const limiter = createByteLimitTransform(maxBytes);
+  try {
+    // A raw Buffer source must be wrapped: pipeline() would otherwise treat
+    // it as a byte-iterable and hand numbers to the streams.
+    const sourceStream = Buffer.isBuffer(source)
+      ? Readable.from([source])
+      : source;
+    await pipeline(sourceStream, createAutoGunzip(), limiter, extractor);
+  } catch (err) {
+    if (err && err.code === 'ERR_ARCHIVE_TOO_MANY_ENTRIES') throw err;
+    if (err && err.code === 'ERR_ARCHIVE_TOO_LARGE') throw err;
+    throw new Error(`Archive extraction failed: ${err && err.message ? err.message : String(err)}`);
+  }
+
+  await assertRepoContained(destRoot, { maxEntries });
+  return destRoot;
+}
+
+/**
+ * Walk an extracted tree WITHOUT following symlinks and verify containment:
+ *  - every regular file/dir lives inside root;
+ *  - every symlink resolves (realpath) inside root; dangling symlinks are
+ *    removed so they can never be followed or copied elsewhere;
+ *  - unsupported entry types are rejected.
+ */
+async function assertRepoContained(rootDir, opts = {}) {
+  const maxEntries = opts.maxEntries ?? MAX_ARCHIVE_ENTRIES;
+  let root;
+  try {
+    root = await fs.realpath(rootDir);
+  } catch (err) {
+    throw new Error(`Extraction directory is unusable: ${err.message}`);
+  }
+
+  const stack = [root];
+  let count = 0;
+
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch (err) {
+      throw new Error(`Failed to inspect extracted directory: ${err.message}`);
+    }
+    for (const entry of entries) {
+      count += 1;
+      if (count > maxEntries) {
+        throw new Error(`Extracted archive exceeds the entry limit (${maxEntries})`);
+      }
+      const abs = path.join(dir, entry.name);
+
+      if (entry.isSymbolicLink()) {
+        let target;
+        try {
+          target = await fs.realpath(abs);
+        } catch {
+          // Dangling symlink: no real content, remove so it can never be
+          // materialized or followed on the destination machine.
+          await fs.remove(abs).catch(() => {});
+          continue;
+        }
+        if (isPathOutside(root, target)) {
+          throw new Error(`Extracted archive contains a symlink escaping the extraction directory: ${entry.name}`);
+        }
+        // Contained symlink (strictly inside): it will be dereferenced at
+        // copy time so no symlinks ever reach the user's agent directories.
+      } else if (entry.isDirectory()) {
+        stack.push(abs);
+      } else if (!entry.isFile()) {
+        throw new Error(`Extracted archive contains an unsupported entry type: ${entry.name}`);
+      }
+    }
+  }
+  return true;
+}
+
+function isPathOutside(root, target) {
+  // A link resolving to the extraction root itself counts as escaping: when
+  // dereferenced, it would attempt a self-recursive copy of the whole tree.
+  const rel = path.relative(root, target);
+  return rel === '' || rel.startsWith('..') || path.isAbsolute(rel);
+}
+
+// ─── Skill name handling ───────────────────────────────────────────────────────
+
+/**
+ * Sanitize a skill name the same way the previous version did
+ * (non [a-zA-Z0-9_-] characters become '-', lowercased) but reject
+ * results that are empty, path-like, reserved on Windows, or oversized.
+ * Returns null when the name is unusable.
+ */
+function sanitizeSkillName(raw) {
+  if (typeof raw !== 'string') return null;
+  const name = raw.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
+  if (name.length === 0 || name.length > MAX_SKILL_NAME_LENGTH) return null;
+  if (name === '.' || name === '..' || /^-+$/.test(name)) return null;
+  if (WINDOWS_RESERVED_NAME.test(name)) return null;
+  return name;
+}
+
+/**
+ * Resolve the skill target directory under baseDir and prove containment.
+ * The base is resolved through realpath (legit symlinked agent config dirs
+ * keep working), and the final containment check runs against the resolved
+ * base. A symlink planted at the exact target path is refused.
+ */
+async function resolveSafeSkillTarget(baseDir, skillName) {
+  if (typeof skillName !== 'string' || skillName.length === 0 ||
+      skillName === '.' || skillName === '..' ||
+      skillName.includes('/') || skillName.includes('\\') || skillName.includes('\0')) {
+    throw new Error(`Invalid skill name: "${skillName}"`);
+  }
+  const base = path.resolve(baseDir);
+  const target = path.resolve(path.join(base, skillName));
+
+  const realBase = (await fs.pathExists(base)) ? await fs.realpath(base) : base;
+  const realTarget = (await fs.pathExists(target)) ? await fs.realpath(target) : target;
+
+  const rel = path.relative(realBase, realTarget);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(`Refusing to operate outside the skill base directory: ${target}`);
+  }
+
+  const lstat = await fs.lstat(target).catch(() => null);
+  if (lstat && lstat.isSymbolicLink()) {
+    throw new Error(`Refusing to operate through a symlink at: ${target}`);
+  }
+
+  return { base: realBase, target, realTarget };
+}
+
+// ─── Install / Remove primitives (no IO side effects on console) ──────────────
+
+async function installToAgentDir(sourceDir, skillName, agentKey, isGlobal) {
+  const agent = AGENTS[agentKey];
+  if (!agent) throw new Error(`Unknown agent: ${agentKey}`);
+  const name = sanitizeSkillName(skillName);
+  if (name === null) throw new Error(`Invalid skill name: "${skillName}"`);
+
+  const baseDir = path.resolve(isGlobal ? agent.globalSkillDir() : agent.localSkillDir(process.cwd()));
+  const { target } = await resolveSafeSkillTarget(baseDir, name);
+
+  await fs.ensureDir(baseDir);
+  await fs.ensureDir(target);
+
+  const st = await fs.lstat(target);
+  if (st.isSymbolicLink()) throw new Error(`Refusing to install through a symlink: ${target}`);
+  if (!st.isDirectory()) throw new Error(`Refusing to install into a non-directory: ${target}`);
+
+  // dereference: symlinks in the downloaded repo (all validated to resolve
+  // inside the extraction root) become real files/dirs in the user's agent
+  // directory, so no link ever survives into installed skills.
+  await fs.copy(sourceDir, target, { overwrite: true, dereference: true });
+  return target;
+}
+
+async function removeAgentSkillDir(baseDir, skillName) {
+  const name = sanitizeSkillName(skillName);
+  if (name === null) throw new Error(`Invalid skill name: "${skillName}"`);
+
+  const { target } = await resolveSafeSkillTarget(baseDir, name);
+
+  if (!(await fs.pathExists(target))) return 'missing';
+
+  const st = await fs.lstat(target);
+  if (st.isSymbolicLink()) throw new Error(`Refusing to remove through a symlink: ${target}`);
+  if (!st.isDirectory()) throw new Error(`Refusing to remove a non-directory: ${target}`);
+
+  await fs.remove(target);
+  return 'removed';
+}
+
+// ─── GitHub download ───────────────────────────────────────────────────────────
+
+/**
+ * Download + extract + validate a GitHub repo tarball into a fresh secure
+ * temp dir. Cleans up its own temp dir on failure.
+ */
+async function downloadAndExtractGitHub(owner, repo, branch) {
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  if (!owner || !repo || !isValidGitHubComponent(owner, 64) || !isValidGitHubComponent(repo, 100)) {
+    throw new Error(`Invalid GitHub repository identifier: ${owner}/${repo}`);
+  }
+  if (!isValidGitHubBranch(branch)) {
+    throw new Error(`Invalid branch: ${branch}`);
+  }
+
+  const tmpDir = await createSecureTempDir('fireskill-');
+  try {
+    await streamTarballToDir(
+      `https://api.github.com/repos/${owner}/${repo}/tarball/${branch}`,
+      token,
+      tmpDir
+    );
+    return tmpDir;
+  } catch (err) {
+    await fs.remove(tmpDir).catch(() => {});
+    if (err.message === 'RETRY_MASTER') {
+      // 404 on the default branch: the CLI handler retries 'master' so the
+      // user sees the attempt; other branches get a clear not-found message.
+      if (branch === 'main') throw new Error('RETRY_MASTER');
+      throw new Error(`Repository not found: ${owner}/${repo} (branch: ${branch})`);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Validate an absolute download URL before any request is made:
+ * https-only, GitHub-owned host.
+ * Returns the parsed URL object or throws.
+ */
+function validateDownloadUrl(urlStr) {
+  let urlObj;
+  try {
+    urlObj = new URL(urlStr);
+  } catch {
+    throw new Error('Invalid download URL');
+  }
+  if (urlObj.protocol !== 'https:') {
+    throw new Error('Refusing non-HTTPS download URL');
+  }
+  if (!isAllowedDownloadHost(urlObj.hostname)) {
+    throw new Error(`Refusing request to non-GitHub host: ${urlObj.hostname}`);
+  }
+  return urlObj;
+}
+
+/**
+ * GET a URL following only safe redirects (https, GitHub-owned hosts,
+ * capped count) and extracting the gzip response into destDir.
+ */
+function streamTarballToDir(requestUrl, token, destDir) {
   return new Promise((resolve, reject) => {
-    const makeRequest = (requestUrl, redirectCount = 0) => {
-      if (redirectCount > 5) {
+    const makeRequest = (currentUrl, redirectCount) => {
+      if (redirectCount > MAX_REDIRECTS) {
         reject(new Error('Too many redirects'));
         return;
       }
 
-      const urlObj = new URL(requestUrl);
-      const options = {
-        hostname: urlObj.hostname,
-        path: urlObj.pathname + urlObj.search,
-        headers: {
-          'User-Agent': 'fireskill-cli',
-          'Accept': 'application/vnd.github+json',
-        }
-      };
-
-      // Add GitHub token if available (for private repos)
-      const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
-      if (token) {
-        options.headers['Authorization'] = `Bearer ${token}`;
+      let urlObj;
+      try {
+        urlObj = validateDownloadUrl(currentUrl);
+      } catch (err) {
+        reject(err);
+        return;
       }
 
-      https.get(options, (res) => {
-        // Handle redirects (GitHub always redirects tarball URLs)
+      const options = buildRequestOptions(urlObj.href, token);
+      const req = https.get(options, (res) => {
+        // Redirects: validate the target before following; the token is only
+        // ever re-attached for allowlisted GitHub hosts (buildRequestOptions).
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          makeRequest(res.headers.location, redirectCount + 1);
+          res.resume(); // drain so we never hold sockets open
+          const next = resolveRedirectUrl(currentUrl, res.headers.location);
+          if (!next) {
+            reject(new Error('Unsafe redirect target'));
+            return;
+          }
+          makeRequest(next, redirectCount + 1);
           return;
         }
 
         if (res.statusCode === 404) {
-          // Try 'master' branch if 'main' failed
-          if (branch === 'main') {
-            reject(new Error('RETRY_MASTER'));
-          } else {
-            reject(new Error(`Repository not found: ${owner}/${repo} (branch: ${branch})`));
-          }
+          res.resume();
+          reject(new Error('RETRY_MASTER'));
           return;
         }
 
         if (res.statusCode !== 200) {
+          res.resume();
           reject(new Error(`GitHub API returned ${res.statusCode}`));
           return;
         }
 
-        // Extract tarball
-        const extractStream = tarExtract({
-          cwd: tmpDir,
-          strip: 1 // Remove the top-level directory from the archive
-        });
-
-        pipeline(res, createGunzip(), extractStream)
-          .then(() => resolve(tmpDir))
-          .catch(reject);
-      }).on('error', reject);
+        extractAndValidateArchive(res, destDir).then(resolve, reject);
+      });
+      req.on('error', reject);
     };
 
-    makeRequest(url);
+    makeRequest(requestUrl, 0);
   });
 }
 
@@ -177,18 +583,32 @@ async function findSkillDir(repoDir) {
 }
 
 /**
- * Extract skill name from SKILL.md frontmatter
+ * Extract skill name from SKILL.md frontmatter.
+ * Reads at most MAX_FRONTMATTER_BYTES so an untrusted repo cannot force an
+ * unbounded read of a huge file.
  */
 async function getSkillName(skillDir) {
   const skillMd = path.join(skillDir, 'SKILL.md');
-  if (!await fs.pathExists(skillMd)) return null;
 
-  const content = await fs.readFile(skillMd, 'utf-8');
-  const frontmatterMatch = content.match(/^---\s*\n([\s\S]*?)\n---/);
-  if (!frontmatterMatch) return null;
+  let fd;
+  try {
+    fd = await fs.promises.open(skillMd, 'r');
+  } catch {
+    return null;
+  }
 
-  const nameMatch = frontmatterMatch[1].match(/^name:\s*(.+)$/m);
-  return nameMatch ? nameMatch[1].trim() : null;
+  try {
+    const buf = Buffer.alloc(MAX_FRONTMATTER_BYTES);
+    const { bytesRead } = await fd.read(buf, 0, MAX_FRONTMATTER_BYTES, 0);
+    const content = buf.toString('utf8', 0, bytesRead);
+    const frontmatterMatch = content.match(/^---\s*\n([\s\S]*?)\n---/);
+    if (!frontmatterMatch) return null;
+
+    const nameMatch = frontmatterMatch[1].match(/^name:\s*(.+)$/m);
+    return nameMatch ? nameMatch[1].trim() : null;
+  } finally {
+    await fd.close().catch(() => {});
+  }
 }
 
 // ─── Install Functions ─────────────────────────────────────────────────────────
@@ -198,14 +618,12 @@ async function installToAgent(sourceDir, skillName, agentKey, isGlobal) {
   const baseDir = isGlobal
     ? agent.globalSkillDir()
     : agent.localSkillDir(process.cwd());
-  const targetDir = path.join(baseDir, skillName);
 
   const spinner = ora(`Installing "${skillName}" for ${agent.name}...`).start();
 
   try {
-    await fs.ensureDir(targetDir);
-    await fs.copy(sourceDir, targetDir, { overwrite: true });
-    spinner.succeed(chalk.green(`✓ "${skillName}" installed for ${agent.name} → ${targetDir}`));
+    const target = await installToAgentDir(sourceDir, skillName, agentKey, isGlobal);
+    spinner.succeed(chalk.green(`✓ "${skillName}" installed for ${agent.name} → ${target}`));
     return true;
   } catch (err) {
     spinner.fail(chalk.red(`✗ Failed to install for ${agent.name}: ${err.message}`));
@@ -235,13 +653,20 @@ async function promptAgentSelection() {
   return answers;
 }
 
+/**
+ * Returns:
+ *  - null when no --agent flag was given (interactive mode to follow)
+ *  - the agent list otherwise
+ * On an unknown agent: prints the error, sets exit code 1 and returns false.
+ */
 function resolveAgents(agentFlag) {
   if (!agentFlag) return null; // trigger interactive mode
   if (agentFlag === 'all') return Object.keys(AGENTS);
   if (AGENTS[agentFlag.toLowerCase()]) return [agentFlag.toLowerCase()];
   console.log(chalk.red(`  Unknown agent: ${agentFlag}`));
   console.log(chalk.dim(`  Available: ${Object.keys(AGENTS).join(', ')}, all`));
-  process.exit(1);
+  process.exitCode = 1;
+  return false;
 }
 
 // ─── CLI Commands ──────────────────────────────────────────────────────────────
@@ -268,6 +693,7 @@ program
     console.log('');
 
     let selectedAgents = resolveAgents(options.agent);
+    if (selectedAgents === false) return;
     let isGlobal = options.global || false;
 
     if (!selectedAgents) {
@@ -278,7 +704,7 @@ program
 
     if (selectedAgents.length === 0) {
       console.log(chalk.yellow('  No agents selected. Exiting.'));
-      process.exit(0);
+      return;
     }
 
     console.log('');
@@ -315,94 +741,107 @@ program
     if (!ghId) {
       console.log(chalk.red(`  Invalid format: "${repo}"`));
       console.log(chalk.dim('  Expected: owner/repo or owner/repo#branch'));
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
 
     console.log(chalk.dim(`  Repository: ${chalk.white(`${ghId.owner}/${ghId.repo}`)} (branch: ${ghId.branch})`));
     console.log('');
 
-    // Download repo
-    let repoDir;
-    const dlSpinner = ora('Downloading repository...').start();
+    let repoDir = null;
     try {
-      repoDir = await downloadGitHubRepo(ghId.owner, ghId.repo, ghId.branch);
-      dlSpinner.succeed(chalk.green('✓ Repository downloaded'));
-    } catch (err) {
-      if (err.message === 'RETRY_MASTER') {
-        // Retry with 'master' branch
-        dlSpinner.text = 'Trying master branch...';
-        try {
-          ghId.branch = 'master';
-          repoDir = await downloadGitHubRepo(ghId.owner, ghId.repo, 'master');
-          dlSpinner.succeed(chalk.green('✓ Repository downloaded (master branch)'));
-        } catch (err2) {
-          dlSpinner.fail(chalk.red(`✗ Failed to download: ${err2.message}`));
-          process.exit(1);
+      // Download repo
+      const dlSpinner = ora('Downloading repository...').start();
+      try {
+        repoDir = await downloadAndExtractGitHub(ghId.owner, ghId.repo, ghId.branch);
+        dlSpinner.succeed(chalk.green('✓ Repository downloaded'));
+      } catch (err) {
+        if (err.message === 'RETRY_MASTER') {
+          // Retry with 'master' branch
+          dlSpinner.text = 'Trying master branch...';
+          try {
+            ghId.branch = 'master';
+            repoDir = await downloadAndExtractGitHub(ghId.owner, ghId.repo, 'master');
+            dlSpinner.succeed(chalk.green('✓ Repository downloaded (master branch)'));
+          } catch (err2) {
+            dlSpinner.fail(chalk.red(`✗ Failed to download: ${err2.message}`));
+            process.exitCode = 1;
+            return;
+          }
+        } else {
+          dlSpinner.fail(chalk.red(`✗ Failed to download: ${err.message}`));
+          console.log('');
+          console.log(chalk.dim('  Tips:'));
+          console.log(chalk.dim('  • Check the repo exists and is public'));
+          console.log(chalk.dim('  • For private repos, set GITHUB_TOKEN or GH_TOKEN env variable'));
+          console.log(chalk.dim('  • Specify a branch: owner/repo#branch-name'));
+          process.exitCode = 1;
+          return;
         }
-      } else {
-        dlSpinner.fail(chalk.red(`✗ Failed to download: ${err.message}`));
+      }
+
+      // Find skill directory
+      const findSpinner = ora('Locating skill files...').start();
+      const skillDir = await findSkillDir(repoDir);
+
+      if (!skillDir) {
+        findSpinner.fail(chalk.red('✗ No skill found in repository'));
         console.log('');
-        console.log(chalk.dim('  Tips:'));
-        console.log(chalk.dim('  • Check the repo exists and is public'));
-        console.log(chalk.dim('  • For private repos, set GITHUB_TOKEN or GH_TOKEN env variable'));
-        console.log(chalk.dim('  • Specify a branch: owner/repo#branch-name'));
-        process.exit(1);
+        console.log(chalk.dim('  The repo must contain one of:'));
+        console.log(chalk.dim('  • skill/SKILL.md'));
+        console.log(chalk.dim('  • skills/SKILL.md'));
+        console.log(chalk.dim('  • SKILL.md (at root)'));
+        process.exitCode = 1;
+        return;
+      }
+      findSpinner.succeed(chalk.green('✓ Skill found'));
+
+      // Determine skill name
+      const rawName = options.name || await getSkillName(skillDir) || ghId.repo;
+      const skillName = sanitizeSkillName(rawName);
+      if (skillName === null) {
+        console.log(chalk.red(`  ✗ Invalid skill name derived from "${rawName}"`));
+        console.log(chalk.dim('  Use --name to provide a valid name (letters, digits, - and _).'));
+        process.exitCode = 1;
+        return;
+      }
+      console.log(chalk.dim(`  Skill name: ${chalk.white(skillName)}`));
+      console.log('');
+
+      // Agent selection
+      let selectedAgents = resolveAgents(options.agent);
+      if (selectedAgents === false) return;
+      let isGlobal = options.global || false;
+
+      if (!selectedAgents) {
+        const answers = await promptAgentSelection();
+        selectedAgents = answers.agents;
+        isGlobal = answers.global;
+      }
+
+      if (selectedAgents.length === 0) {
+        console.log(chalk.yellow('  No agents selected. Exiting.'));
+        return;
+      }
+
+      console.log('');
+
+      // Install
+      let successCount = 0;
+      for (const agentKey of selectedAgents) {
+        const ok = await installToAgent(skillDir, skillName, agentKey, isGlobal);
+        if (ok) successCount++;
+      }
+
+      printResult(successCount, selectedAgents.length);
+      console.log(chalk.dim(`  Installed from: ${chalk.white(`github.com/${ghId.owner}/${ghId.repo}`)}`));
+      console.log('');
+    } finally {
+      // Always clean up the temp dir, on every path above.
+      if (repoDir) {
+        await fs.remove(repoDir).catch(() => {});
       }
     }
-
-    // Find skill directory
-    const findSpinner = ora('Locating skill files...').start();
-    const skillDir = await findSkillDir(repoDir);
-
-    if (!skillDir) {
-      findSpinner.fail(chalk.red('✗ No skill found in repository'));
-      console.log('');
-      console.log(chalk.dim('  The repo must contain one of:'));
-      console.log(chalk.dim('  • skill/SKILL.md'));
-      console.log(chalk.dim('  • skills/SKILL.md'));
-      console.log(chalk.dim('  • SKILL.md (at root)'));
-      await fs.remove(repoDir);
-      process.exit(1);
-    }
-    findSpinner.succeed(chalk.green('✓ Skill found'));
-
-    // Determine skill name
-    let skillName = options.name || await getSkillName(skillDir) || ghId.repo;
-    skillName = skillName.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
-    console.log(chalk.dim(`  Skill name: ${chalk.white(skillName)}`));
-    console.log('');
-
-    // Agent selection
-    let selectedAgents = resolveAgents(options.agent);
-    let isGlobal = options.global || false;
-
-    if (!selectedAgents) {
-      const answers = await promptAgentSelection();
-      selectedAgents = answers.agents;
-      isGlobal = answers.global;
-    }
-
-    if (selectedAgents.length === 0) {
-      console.log(chalk.yellow('  No agents selected. Exiting.'));
-      await fs.remove(repoDir);
-      process.exit(0);
-    }
-
-    console.log('');
-
-    // Install
-    let successCount = 0;
-    for (const agentKey of selectedAgents) {
-      const ok = await installToAgent(skillDir, skillName, agentKey, isGlobal);
-      if (ok) successCount++;
-    }
-
-    // Cleanup temp dir
-    await fs.remove(repoDir);
-
-    printResult(successCount, selectedAgents.length);
-    console.log(chalk.dim(`  Installed from: ${chalk.white(`github.com/${ghId.owner}/${ghId.repo}`)}`));
-    console.log('');
   });
 
 // ─── remove: Remove a GitHub-installed skill ─────────────────────────────────
@@ -417,9 +856,15 @@ program
     console.log(chalk.bold.red('  🗑️  FireSkill — Remove Skill'));
     console.log('');
 
-    skillName = skillName.replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
+    const name = sanitizeSkillName(skillName);
+    if (name === null) {
+      console.log(chalk.red(`  Invalid skill name: "${skillName}"`));
+      process.exitCode = 1;
+      return;
+    }
 
     let selectedAgents = resolveAgents(options.agent);
+    if (selectedAgents === false) return;
     let isGlobal = options.global || false;
 
     if (!selectedAgents) {
@@ -427,7 +872,7 @@ program
         {
           type: 'checkbox',
           name: 'agents',
-          message: `Remove "${skillName}" from which agents?`,
+          message: `Remove "${name}" from which agents?`,
           choices: Object.entries(AGENTS).map(([key, val]) => ({
             name: val.name,
             value: key
@@ -449,18 +894,17 @@ program
       const baseDir = isGlobal
         ? agent.globalSkillDir()
         : agent.localSkillDir(process.cwd());
-      const targetDir = path.join(baseDir, skillName);
 
-      const spinner = ora(`Removing "${skillName}" from ${agent.name}...`).start();
-      if (await fs.pathExists(targetDir)) {
-        try {
-          await fs.remove(targetDir);
-          spinner.succeed(chalk.green(`✓ Removed "${skillName}" from ${agent.name}`));
-        } catch (err) {
-          spinner.fail(chalk.red(`✗ Failed: ${err.message}`));
+      const spinner = ora(`Removing "${name}" from ${agent.name}...`).start();
+      try {
+        const result = await removeAgentSkillDir(baseDir, name);
+        if (result === 'removed') {
+          spinner.succeed(chalk.green(`✓ Removed "${name}" from ${agent.name}`));
+        } else {
+          spinner.warn(chalk.yellow(`⊘ "${name}" not found for ${agent.name}`));
         }
-      } else {
-        spinner.warn(chalk.yellow(`⊘ "${skillName}" not found for ${agent.name}`));
+      } catch (err) {
+        spinner.fail(chalk.red(`✗ Failed: ${err.message}`));
       }
     }
     console.log('');
@@ -479,6 +923,7 @@ program
     console.log('');
 
     let selectedAgents = resolveAgents(options.agent);
+    if (selectedAgents === false) return;
     let isGlobal = options.global || false;
 
     if (!selectedAgents) {
@@ -508,18 +953,17 @@ program
       const baseDir = isGlobal
         ? agent.globalSkillDir()
         : agent.localSkillDir(process.cwd());
-      const targetDir = path.join(baseDir, 'fireskill');
 
       const spinner = ora(`Removing FireSkill from ${agent.name}...`).start();
-      if (await fs.pathExists(targetDir)) {
-        try {
-          await fs.remove(targetDir);
+      try {
+        const result = await removeAgentSkillDir(baseDir, 'fireskill');
+        if (result === 'removed') {
           spinner.succeed(chalk.green(`✓ Removed from ${agent.name}`));
-        } catch (err) {
-          spinner.fail(chalk.red(`✗ Failed: ${err.message}`));
+        } else {
+          spinner.warn(chalk.yellow(`⊘ FireSkill not found for ${agent.name}`));
         }
-      } else {
-        spinner.warn(chalk.yellow(`⊘ FireSkill not found for ${agent.name}`));
+      } catch (err) {
+        spinner.fail(chalk.red(`✗ Failed: ${err.message}`));
       }
     }
     console.log('');
@@ -538,7 +982,9 @@ program
     console.log(chalk.dim('  ─────────────────────────────────────'));
     console.log('');
 
-    const selectedAgents = resolveAgents(options.agent) || Object.keys(AGENTS);
+    let selectedAgents = resolveAgents(options.agent);
+    if (selectedAgents === false) return;
+    if (!selectedAgents) selectedAgents = Object.keys(AGENTS);
     const isGlobal = options.global !== undefined ? options.global : true;
 
     for (const agentKey of selectedAgents) {
@@ -605,4 +1051,35 @@ function printResult(successCount, totalCount) {
 
 // ─── Parse & Run ─────────────────────────────────────────────────────────────
 
-program.parse();
+// Only run the CLI when executed directly, so tests can import the module
+// without triggering commander or process.exit behavior.
+const isMain =
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+if (isMain) {
+  program.parse();
+}
+
+// ─── Exports (test surface) ───────────────────────────────────────────────────
+
+export {
+  AGENTS,
+  parseGitHubId,
+  isAllowedDownloadHost,
+  validateDownloadUrl,
+  resolveRedirectUrl,
+  buildRequestOptions,
+  createSecureTempDir,
+  extractAndValidateArchive,
+  assertRepoContained,
+  sanitizeSkillName,
+  resolveSafeSkillTarget,
+  installToAgentDir,
+  removeAgentSkillDir,
+  getSkillName,
+  findSkillDir,
+  listSkillsInDir,
+  MAX_REDIRECTS,
+  MAX_ARCHIVE_ENTRIES,
+  MAX_ARCHIVE_BYTES,
+};
