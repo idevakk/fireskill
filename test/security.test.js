@@ -176,6 +176,126 @@ test('an archive whose symlink references its own ancestor fails fast instead of
   });
 });
 
+test('a `..`-spelled ancestor-referencing symlink is rejected at extraction', async () => {
+  await withTempDir(async (tmp) => {
+    const dest = path.join(tmp, 'out');
+    await fs.mkdir(dest);
+    // `skill/self-up -> ../skill` lexically resolves to the link's own parent
+    // directory. node-tar accepts this spelling (it resolves inside the
+    // extraction dir), so the gate must treat it like `self -> skill`.
+    const hostile = gitHubStyleArchive([
+      { name: 'skill', type: '5' },
+      { name: 'skill/SKILL.md', data: '---\nname: x\n---\n' },
+      { name: 'skill/self-up', type: '2', linkname: '../skill' },
+    ]);
+    const started = Date.now();
+    await assert.rejects(
+      () => extractAndValidateArchive(hostile, dest),
+      /self-referencing|ancestor|dereferences/i
+    );
+    assert.ok(Date.now() - started < 10000, 'must fail fast instead of hanging');
+    assert.deepEqual(
+      (await fs.readdir(tmp)).filter((n) => n !== 'out'),
+      [],
+      'nothing may leak outside the extraction dir'
+    );
+  });
+});
+
+test('a `.`/`..`-spelled self-parent symlink cannot survive extraction', async () => {
+  await withTempDir(async (tmp) => {
+    const dest = path.join(tmp, 'out');
+    await fs.mkdir(dest);
+    // `skill/a -> ..` resolves to the extraction root, which the containment
+    // walk treats as escaping (dereferencing it would recurse over the whole
+    // tree); `skill/a -> .` resolves to the link's own parent dir. Both
+    // spellings must abort extraction with a clear error, not a hang.
+    for (const linkname of ['.', '..']) {
+      const hostile = gitHubStyleArchive([
+        { name: 'skill', type: '5' },
+        { name: 'skill/SKILL.md', data: '---\nname: x\n---\n' },
+        { name: 'skill/a', type: '2', linkname },
+      ]);
+      const started = Date.now();
+      await assert.rejects(
+        () => extractAndValidateArchive(hostile, dest),
+        /escaping|dereferences|ancestor/i
+      );
+      assert.ok(Date.now() - started < 10000, 'must fail fast instead of hanging');
+      assert.deepEqual(
+        (await fs.readdir(tmp)).filter((n) => n !== 'out'),
+        [],
+        'nothing may leak outside the extraction dir'
+      );
+      await fs.remove(dest);
+      await fs.mkdir(dest);
+    }
+  });
+});
+
+test('assertRepoContained rejects a self-parent symlink built directly on disk', async () => {
+  await withTempDir(async (tmp) => {
+    const root = path.join(tmp, 'root');
+    await fs.ensureDir(path.join(root, 'sub'));
+    await fs.writeFile(path.join(root, 'SKILL.md'), 'x');
+    // sub/a -> . resolves to the link's own parent directory: a
+    // dereferencing copy would recurse into itself forever.
+    await fs.symlink('.', path.join(root, 'sub', 'a'));
+
+    await assert.rejects(
+      () => assertRepoContained(root),
+      /dereferenc/i
+    );
+    // A benign contained link elsewhere still passes the boundary check.
+    await fs.remove(path.join(root, 'sub', 'a'));
+    await fs.symlink(path.join(root, 'SKILL.md'), path.join(root, 'sub', 'alias.md'));
+    await assertRepoContained(root);
+  });
+});
+
+test('sibling-style links with `..` targets that resolve inside the root are not false positives', async () => {
+  await withTempDir(async (tmp) => {
+    const dest = path.join(tmp, 'out');
+    await fs.mkdir(dest);
+    // `links/doc-link -> ../common/doc.md` resolves to a sibling path inside
+    // the root, not to any ancestor of the link itself.
+    const archive = gitHubStyleArchive([
+      { name: 'common', type: '5' },
+      { name: 'common/doc.md', data: 'doc' },
+      { name: 'links', type: '5' },
+      { name: 'links/doc-link', type: '2', linkname: '../common/doc.md' },
+      { name: 'skill', type: '5' },
+      { name: 'skill/SKILL.md', data: '---\nname: x\n---\n' },
+    ]);
+    await extractAndValidateArchive(archive, dest);
+    const files = await listAll(dest);
+    for (const f of files) {
+      if (f.isLink) {
+        const target = await fs.realpath(f.abs);
+        assert.ok(target.startsWith(dest + path.sep), 'symlink target escapes root');
+      }
+    }
+  });
+});
+
+test('installToAgentDir refuses a source tree containing a dereference-cycle symlink', async () => {
+  await withSandboxedHome(async (home) => {
+    const src = path.join(home, 'cycle-src');
+    await fs.ensureDir(src);
+    await fs.writeFile(path.join(src, 'SKILL.md'), '---\nname: cycle\n---\n');
+    await fs.symlink(src, path.join(src, 'back')); // back -> own parent dir
+
+    await assert.rejects(
+      () => installToAgentDir(src, 'cycle', 'claude', true),
+      /Refusing to copy|dereferences/i
+    );
+    assert.ok(
+      !(await fs.pathExists(path.join(home, '.claude', 'skills', 'cycle'))),
+      'nothing may be installed from a cycle-shaped source'
+    );
+  });
+});
+
 test('the extraction deadline bounds even a never-ending archive stream', async () => {
   await withTempDir(async (tmp) => {
     const dest = path.join(tmp, 'out');

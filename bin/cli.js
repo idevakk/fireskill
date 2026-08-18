@@ -323,7 +323,7 @@ function isSelfReferencingSymlink(entry) {
   if (rawLink == null || rawLink === '') return false;
   if (typeof rawLink !== 'string') return false;
   const target = rawLink.replace(/\\/g, '/');
-  if (target.includes('\0') || target.split('/').includes('..')) return false;
+  if (target.includes('\0')) return false;
   const candidates = [];
   if (target.startsWith('/')) {
     candidates.push(path.posix.normalize(target.replace(/^\/+/, '')));
@@ -385,6 +385,9 @@ async function assertRepoContained(rootDir, opts = {}) {
         if (isPathOutside(root, target)) {
           throw new Error(`Extracted archive contains a symlink escaping the extraction directory: ${entry.name}`);
         }
+        if (isDereferenceCycle(abs, target)) {
+          throw new Error(`Extracted archive contains a symlink dereferencing into its own directory tree: ${entry.name}`);
+        }
         // Contained symlink (strictly inside): it will be dereferenced at
         // copy time so no symlinks ever reach the user's agent directories.
       } else if (entry.isDirectory()) {
@@ -402,6 +405,51 @@ function isPathOutside(root, target) {
   // dereferenced, it would attempt a self-recursive copy of the whole tree.
   const rel = path.relative(root, target);
   return rel === '' || rel.startsWith('..') || path.isAbsolute(rel);
+}
+
+/**
+ * True when a symlink resolves to a path that contains the link itself
+ * (the dereference-cycle condition): a dereferencing recursive copy would
+ * keep following the link forever, so such a link must never survive.
+ */
+function isDereferenceCycle(linkAbsPath, resolvedTarget) {
+  const rel = path.relative(resolvedTarget, linkAbsPath);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/**
+ * Walk a source tree without following symlinks and refuse any symlink that
+ * would make a dereferencing recursive copy spin. Independent of the
+ * extraction-time validation: this guards the copy boundary itself so a
+ * cycle-shaped source can never reach fs.copy.
+ */
+async function rejectDereferenceCycles(sourceDir) {
+  const stack = [sourceDir];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const abs = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) {
+        let target;
+        try {
+          target = await fs.realpath(abs);
+        } catch {
+          continue;
+        }
+        if (isDereferenceCycle(abs, target)) {
+          throw new Error(`Refusing to copy a symlink that dereferences into its own directory tree: ${entry.name}`);
+        }
+      } else if (entry.isDirectory()) {
+        stack.push(abs);
+      }
+    }
+  }
 }
 
 // ─── Skill name handling ───────────────────────────────────────────────────────
@@ -459,6 +507,8 @@ async function installToAgentDir(sourceDir, skillName, agentKey, isGlobal) {
   if (!agent) throw new Error(`Unknown agent: ${agentKey}`);
   const name = sanitizeSkillName(skillName);
   if (name === null) throw new Error(`Invalid skill name: "${skillName}"`);
+
+  await rejectDereferenceCycles(sourceDir);
 
   const baseDir = path.resolve(isGlobal ? agent.globalSkillDir() : agent.localSkillDir(process.cwd()));
   const { target } = await resolveSafeSkillTarget(baseDir, name);
