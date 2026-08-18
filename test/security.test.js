@@ -30,6 +30,7 @@ import {
   MAX_REDIRECTS,
 } from '../bin/cli.js';
 import { tarEntry, tarArchive, gitHubStyleArchive } from './helpers/tar-builder.js';
+import { Readable } from 'stream';
 
 const win32 = process.platform === 'win32';
 
@@ -153,6 +154,45 @@ test('dangling symlinks are removed during validation', async () => {
 
     await extractAndValidateArchive(archive, dest);
     assert.ok(!(await fs.pathExists(path.join(dest, 'skill', 'dangling.md'))), 'dangling symlink must be removed');
+  });
+});
+
+test('an archive whose symlink references its own ancestor fails fast instead of hanging', async () => {
+  await withTempDir(async (tmp) => {
+    const dest = path.join(tmp, 'out');
+    await fs.mkdir(dest);
+    // node-tar 7.5.x deadlocks its async unpack on this shape; the gate must
+    // reject it promptly so `add` never spins on a malicious repo.
+    const hostile = gitHubStyleArchive([
+      { name: 'skill', type: '5' },
+      { name: 'skill/self', type: '2', linkname: 'skill' },
+    ]);
+    const started = Date.now();
+    await assert.rejects(
+      () => extractAndValidateArchive(hostile, dest),
+      /self-referencing|ancestor/i
+    );
+    assert.ok(Date.now() - started < 10000, 'must fail fast instead of hanging');
+  });
+});
+
+test('the extraction deadline bounds even a never-ending archive stream', async () => {
+  await withTempDir(async (tmp) => {
+    const dest = path.join(tmp, 'out');
+    await fs.mkdir(dest);
+    const archive = gitHubStyleArchive([
+      { name: 'skill/SKILL.md', data: 'x' },
+    ]);
+    const neverEnding = new Readable({ read() {} });
+    neverEnding.push(archive);
+    // Never push(null): the stream never terminates, so only the watchdog
+    // can bound this call.
+    const started = Date.now();
+    await assert.rejects(
+      () => extractAndValidateArchive(neverEnding, dest, { timeoutMs: 1000 }),
+      /timed out/i
+    );
+    assert.ok(Date.now() - started < 10000, 'must fail within the deadline');
   });
 });
 

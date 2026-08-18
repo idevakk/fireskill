@@ -82,6 +82,7 @@ const ALLOWED_DOWNLOAD_HOSTS = new Set([
 const MAX_REDIRECTS = 5;
 const MAX_ARCHIVE_ENTRIES = 100000; // 100k files is far beyond any sane skill repo
 const MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024; // 1 GiB uncompressed tarball cap
+const EXTRACT_TIMEOUT_MS = 10 * 60 * 1000; // hard deadline: a hostile archive must never hang the CLI
 const MAX_FRONTMATTER_BYTES = 64 * 1024; // SKILL.md frontmatter read cap
 const MAX_SKILL_NAME_LENGTH = 100;
 const GITHUB_COMPONENT_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*)$/;
@@ -244,10 +245,25 @@ function createAutoGunzip() {
  *  4. Uncompressed byte cap via a counting transform.
  *  5. Post-extraction walk (`assertRepoContained`): independent verification
  *     that nothing on disk resolves outside destRoot.
+ *  6. A hard wall-clock deadline aborts the whole pipeline (and the caller's
+ *     signal can abort it too), so a deadlocking archive can never hang the
+ *     CLI; the caller's cleanup path removes the temp dir on this error.
+ *  7. Symlink entries whose target resolves to the link's own ancestor or
+ *     itself are rejected before materialization: node-tar 7.x deadlocks its
+ *     async unpack on some of these shapes and dereferencing them recurses.
  */
 async function extractAndValidateArchive(source, destRoot, opts = {}) {
   const maxEntries = opts.maxEntries ?? MAX_ARCHIVE_ENTRIES;
   const maxBytes = opts.maxBytes ?? MAX_ARCHIVE_BYTES;
+  const timeoutMs = opts.timeoutMs ?? EXTRACT_TIMEOUT_MS;
+
+  const controller = new AbortController();
+  const watchdog = setTimeout(() => controller.abort(), timeoutMs);
+  const onExternalAbort = () => controller.abort();
+  if (opts.signal) {
+    if (opts.signal.aborted) controller.abort();
+    else opts.signal.addEventListener('abort', onExternalAbort, { once: true });
+  }
 
   const extractor = tarExtract({
     cwd: destRoot,
@@ -257,13 +273,19 @@ async function extractAndValidateArchive(source, destRoot, opts = {}) {
   });
 
   let entryCount = 0;
-  extractor.on('entry', () => {
+  extractor.on('entry', (entry) => {
     entryCount += 1;
     if (entryCount > maxEntries) {
       // Minipass-based tar streams expose abort() rather than destroy().
       extractor.abort(Object.assign(new Error(`Archive contains more than ${maxEntries} entries`), {
         code: 'ERR_ARCHIVE_TOO_MANY_ENTRIES',
       }));
+      return;
+    }
+    if (isSelfReferencingSymlink(entry)) {
+      extractor.abort(Object.assign(new Error(
+        `Archive contains a symlink referencing itself or its own ancestor: ${entry.path || ''}`
+      ), { code: 'ERR_ARCHIVE_SELF_REFERENCING_SYMLINK' }));
     }
   });
 
@@ -274,15 +296,46 @@ async function extractAndValidateArchive(source, destRoot, opts = {}) {
     const sourceStream = Buffer.isBuffer(source)
       ? Readable.from([source])
       : source;
-    await pipeline(sourceStream, createAutoGunzip(), limiter, extractor);
+    await pipeline(sourceStream, createAutoGunzip(), limiter, extractor, { signal: controller.signal });
   } catch (err) {
     if (err && err.code === 'ERR_ARCHIVE_TOO_MANY_ENTRIES') throw err;
     if (err && err.code === 'ERR_ARCHIVE_TOO_LARGE') throw err;
+    if (err && err.code === 'ERR_ARCHIVE_SELF_REFERENCING_SYMLINK') throw err;
+    if (controller.signal.aborted || (err && err.name === 'AbortError')) {
+      throw Object.assign(new Error(`Archive extraction timed out after ${timeoutMs}ms`), {
+        code: 'ERR_FIRESKILL_TIMED_OUT',
+      });
+    }
     throw new Error(`Archive extraction failed: ${err && err.message ? err.message : String(err)}`);
+  } finally {
+    clearTimeout(watchdog);
+    if (opts.signal) opts.signal.removeEventListener('abort', onExternalAbort);
   }
 
   await assertRepoContained(destRoot, { maxEntries });
   return destRoot;
+}
+
+function isSelfReferencingSymlink(entry) {
+  if (!entry || entry.type !== 'SymbolicLink') return false;
+  const linkPath = String(entry.path || '').replace(/\\/g, '/');
+  const rawLink = entry.linkpath;
+  if (rawLink == null || rawLink === '') return false;
+  if (typeof rawLink !== 'string') return false;
+  const target = rawLink.replace(/\\/g, '/');
+  if (target.includes('\0') || target.split('/').includes('..')) return false;
+  const candidates = [];
+  if (target.startsWith('/')) {
+    candidates.push(path.posix.normalize(target.replace(/^\/+/, '')));
+  } else {
+    candidates.push(path.posix.normalize(target));
+    candidates.push(path.posix.normalize(path.posix.join(path.posix.dirname(linkPath), target)));
+  }
+  for (const candidate of candidates) {
+    if (candidate === '' || candidate === '.' || candidate === '..' || candidate.startsWith('../')) continue;
+    if (linkPath === candidate || linkPath.startsWith(candidate + '/')) return true;
+  }
+  return false;
 }
 
 /**
@@ -456,15 +509,21 @@ async function downloadAndExtractGitHub(owner, repo, branch) {
   }
 
   const tmpDir = await createSecureTempDir('fireskill-');
+
+  const controller = new AbortController();
+  const watchdog = setTimeout(() => controller.abort(), EXTRACT_TIMEOUT_MS);
+
   try {
     await streamTarballToDir(
       `https://api.github.com/repos/${owner}/${repo}/tarball/${branch}`,
       token,
-      tmpDir
+      tmpDir,
+      controller.signal
     );
     return tmpDir;
   } catch (err) {
     await fs.remove(tmpDir).catch(() => {});
+    if (err && err.code === 'ERR_FIRESKILL_TIMED_OUT') throw err;
     if (err.message === 'RETRY_MASTER') {
       // 404 on the default branch: the CLI handler retries 'master' so the
       // user sees the attempt; other branches get a clear not-found message.
@@ -472,6 +531,8 @@ async function downloadAndExtractGitHub(owner, repo, branch) {
       throw new Error(`Repository not found: ${owner}/${repo} (branch: ${branch})`);
     }
     throw err;
+  } finally {
+    clearTimeout(watchdog);
   }
 }
 
@@ -499,12 +560,34 @@ function validateDownloadUrl(urlStr) {
 /**
  * GET a URL following only safe redirects (https, GitHub-owned hosts,
  * capped count) and extracting the gzip response into destDir.
+ * An external AbortSignal (the operation-wide watchdog) aborts the
+ * in-flight request and any ongoing extraction.
  */
-function streamTarballToDir(requestUrl, token, destDir) {
+function streamTarballToDir(requestUrl, token, destDir, signal) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (err) => { if (settled) return; settled = true; reject(err); };
+    const succeed = (value) => { if (settled) return; settled = true; resolve(value); };
+
+    let req = null;
+    const onAbort = () => {
+      if (settled) return;
+      const timeoutError = Object.assign(
+        new Error(`Download and extraction timed out after ${EXTRACT_TIMEOUT_MS}ms`),
+        { code: 'ERR_FIRESKILL_TIMED_OUT' }
+      );
+      if (req && !req.destroyed) req.destroy();
+      fail(timeoutError);
+    };
+    if (signal) {
+      if (signal.aborted) { onAbort(); return; }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
     const makeRequest = (currentUrl, redirectCount) => {
+      if (settled) return;
       if (redirectCount > MAX_REDIRECTS) {
-        reject(new Error('Too many redirects'));
+        fail(new Error('Too many redirects'));
         return;
       }
 
@@ -512,19 +595,20 @@ function streamTarballToDir(requestUrl, token, destDir) {
       try {
         urlObj = validateDownloadUrl(currentUrl);
       } catch (err) {
-        reject(err);
+        fail(err);
         return;
       }
 
       const options = buildRequestOptions(urlObj.href, token);
-      const req = https.get(options, (res) => {
+      req = https.get(options, (res) => {
+        if (settled) return;
         // Redirects: validate the target before following; the token is only
         // ever re-attached for allowlisted GitHub hosts (buildRequestOptions).
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume(); // drain so we never hold sockets open
           const next = resolveRedirectUrl(currentUrl, res.headers.location);
           if (!next) {
-            reject(new Error('Unsafe redirect target'));
+            fail(new Error('Unsafe redirect target'));
             return;
           }
           makeRequest(next, redirectCount + 1);
@@ -533,19 +617,19 @@ function streamTarballToDir(requestUrl, token, destDir) {
 
         if (res.statusCode === 404) {
           res.resume();
-          reject(new Error('RETRY_MASTER'));
+          fail(new Error('RETRY_MASTER'));
           return;
         }
 
         if (res.statusCode !== 200) {
           res.resume();
-          reject(new Error(`GitHub API returned ${res.statusCode}`));
+          fail(new Error(`GitHub API returned ${res.statusCode}`));
           return;
         }
 
-        extractAndValidateArchive(res, destDir).then(resolve, reject);
+        extractAndValidateArchive(res, destDir, { signal }).then(succeed, fail);
       });
-      req.on('error', reject);
+      req.on('error', fail);
     };
 
     makeRequest(requestUrl, 0);

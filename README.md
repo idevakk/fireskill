@@ -73,9 +73,11 @@ The `add` command:
 > only (`github.com`, `api.github.com`, `codeload.github.com`, `objects.githubusercontent.com`,
 > `raw.githubusercontent.com`); the token is never sent anywhere else. Archives
 > are extracted with strict path-traversal protection (absolute paths, `..`
-> entries and escaping symlinks abort the download), extracted symlinks are
-> dereferenced so installed skills never contain links, and temp directories
-> are unique and mode `0700`.
+> entries, escaping symlinks and self- or ancestor-referencing symlinks abort
+> the download), extraction runs under a hard 10-minute deadline so a hostile
+> archive can never hang the CLI, extracted symlinks are dereferenced so
+> installed skills never contain links, and temp directories are unique,
+> mode `0700` and cleaned up on every failure path.
 
 #### Skill names
 
