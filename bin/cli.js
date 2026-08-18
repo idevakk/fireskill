@@ -8,7 +8,7 @@
  *   npx fireskill install --agent gemini --global → Install for specific agent globally
  *   npx fireskill add owner/repo                  → Install any skill from a GitHub repo
  *   npx fireskill add owner/repo --agent claude   → Install GitHub skill for specific agent
- *   npx fireskill remove owner/repo               → Remove a GitHub-installed skill
+ *   npx fireskill remove skill-name               → Remove an installed skill by name
  *   npx fireskill uninstall                       → Remove FireSkill's built-in meta-skill
  *   npx fireskill list                            → List all installed skills
  */

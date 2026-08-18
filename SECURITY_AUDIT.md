@@ -104,7 +104,7 @@ Reviewed all markdown for instructions that would make an agent execute unsaniti
 
 ## Test suite
 
-`test/security.test.js` (20 tests, offline, `npm test`): crafted malicious tarballs (`../` entries, absolute paths, hostile symlinks, dangling symlinks, oversized counts/bytes) cannot write or read outside the extraction dir; traversal-shaped skill names on add+remove cannot escape the agent skill base; the token is never attached off-allowlist; temp dirs are unique and mode 0700; malformed repo ids are rejected; install/remove/list behave correctly against fixtures with a sandboxed `HOME`; symlinks never survive into installed skills.
+`test/security.test.js` (27 tests, offline, `npm test`): crafted malicious tarballs (`../` entries, absolute paths, hostile symlinks, dangling symlinks, oversized counts/bytes) cannot write or read outside the extraction dir; traversal-shaped skill names on add+remove cannot escape the agent skill base; the token is never attached off-allowlist; temp dirs are unique and mode 0700; malformed repo ids are rejected; install/remove/list behave correctly against fixtures with a sandboxed `HOME`; symlinks never survive into installed skills.
 
 Live smoke (real GitHub, sandboxed HOME): `install`, `add idevakk/fireskill`, `list`, `remove`, `uninstall`, bad-branch not-found message, invalid repo ids — all behave as documented, exit codes correct, zero temp-dir leaks.
 
