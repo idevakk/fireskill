@@ -27,10 +27,13 @@ import {
   getSkillName,
   findSkillDir,
   listSkillsInDir,
+  createAutoGunzip,
   MAX_REDIRECTS,
 } from '../bin/cli.js';
 import { tarEntry, tarArchive, gitHubStyleArchive } from './helpers/tar-builder.js';
-import { Readable } from 'stream';
+import { Readable, Writable } from 'stream';
+import { gzipSync } from 'zlib';
+import { pipeline } from 'stream/promises';
 
 const win32 = process.platform === 'win32';
 
@@ -634,4 +637,56 @@ test('listSkillsInDir reports only real directories (never symlinks)', async () 
     const names = skills.map((s) => s.name).sort();
     assert.deepEqual(names, ['real-skill']);
   });
+});
+
+// ─── 8. auto-gunzip stream (`createAutoGunzip`) ──────────────────────────────
+
+async function autoGunzipOnce(input) {
+  const parts = [];
+  const sink = new Writable({
+    write(c, _enc, cb) {
+      parts.push(c);
+      cb();
+    },
+  });
+  await pipeline(Readable.from([input]), createAutoGunzip(), sink);
+  return Buffer.concat(parts);
+}
+
+test('auto-gunzip: gzip with a 1-byte first chunk still decompresses', async () => {
+  const payload = Buffer.from('fireskill-chunked-gzip-'.repeat(500));
+  const gz = gzipSync(payload);
+  const out = await autoGunzipOnce(Buffer.concat([gz.subarray(0, 1), gz.subarray(1)]));
+  assert.ok(out.equals(payload), 'gzip split across the decision boundary must decompress');
+});
+
+test('auto-gunzip: plain tar with a 1-byte first chunk passes through unchanged', async () => {
+  const tar = Buffer.from('plain-ustar-tar-bytes-'.repeat(200));
+  const out = await autoGunzipOnce(Buffer.concat([tar.subarray(0, 1), tar.subarray(1)]));
+  assert.ok(out.equals(tar), 'plain tar must pass through untouched');
+});
+
+test('auto-gunzip: backpressured downstream consumer does not stall decompression', async () => {
+  const payload = Buffer.alloc(2 * 1024 * 1024, 0x63);
+  const gz = gzipSync(payload);
+  let received = 0;
+  const sink = new Writable({
+    // Tiny buffer + deliberately slow writes force push() to return false and
+    // exercise the gunzip pause/resume path (regression for stalled extraction).
+    highWaterMark: 1,
+    write(c, _enc, cb) {
+      received += c.length;
+      setTimeout(cb, 1);
+    },
+  });
+  let bailTimer;
+  const watch = new Promise((_, reject) => {
+    bailTimer = setTimeout(
+      () => reject(new Error('auto-gunzip stalled under backpressure')),
+      10_000,
+    );
+  });
+  await Promise.race([pipeline(Readable.from([gz]), createAutoGunzip(), sink), watch]);
+  clearTimeout(bailTimer);
+  assert.equal(received, payload.length);
 });

@@ -202,57 +202,69 @@ function createByteLimitTransform(limit) {
  * this also tolerates plain tar streams and makes extraction testable with
  * locally crafted archives.
  */
-function createAutoGunzip() {
-  let gunzip = null;
-  let decided = false;
-  let sniff = Buffer.alloc(0);
-  return new Transform({
-    transform(chunk, _enc, cb) {
-      if (!decided) {
-        // Keep buffering until at least two bytes are available so a gzip
-        // stream split across chunk boundaries is still detected.
-        sniff = sniff.length === 0 ? chunk : Buffer.concat([sniff, chunk]);
-        if (sniff.length < 2) {
-          cb();
-          return;
-        }
-        chunk = sniff;
-        sniff = Buffer.alloc(0);
-        decided = true;
-        if (chunk[0] === 0x1f && chunk[1] === 0x8b) {
-          gunzip = createGunzip();
-          gunzip.on('data', (d) => {
-            // Respect readable-side backpressure: a decompression bomb must
-            // not fill our readable buffer before the byte limiter rejects it.
-            if (!this.push(d)) gunzip.pause();
-          });
-          gunzip.on('error', (e) => this.destroy(e));
-        }
-      }
-      if (gunzip) {
-        gunzip.write(chunk, cb);
-      } else {
-        cb(null, chunk);
-      }
-    },
-    flush(cb) {
-      // A stream that ended before two bytes ever arrived: emit what was kept.
-      if (sniff.length > 0) {
-        this.push(sniff);
-        sniff = Buffer.alloc(0);
-      }
-      if (gunzip) {
-        gunzip.end();
-        gunzip.on('end', () => cb());
-      } else {
+class AutoGunzipStream extends Transform {
+  constructor() {
+    super();
+    this.gunzip = null;
+    this.decided = false;
+    this.sniff = Buffer.alloc(0);
+  }
+
+  _transform(chunk, _enc, cb) {
+    if (!this.decided) {
+      // Keep buffering until at least two bytes are available so a gzip
+      // stream split across chunk boundaries is still detected.
+      this.sniff =
+        this.sniff.length === 0 ? chunk : Buffer.concat([this.sniff, chunk]);
+      if (this.sniff.length < 2) {
         cb();
+        return;
       }
-    },
-    _read() {
-      // Consumer wants more decompressed data; resume a paused gunzip.
-      if (gunzip) gunzip.resume();
-    },
-  });
+      chunk = this.sniff;
+      this.sniff = Buffer.alloc(0);
+      this.decided = true;
+      if (chunk[0] === 0x1f && chunk[1] === 0x8b) {
+        this.gunzip = createGunzip();
+        this.gunzip.on('data', (d) => {
+          // Respect readable-side backpressure: a decompression bomb must
+          // not fill our readable buffer before the byte limiter rejects it.
+          if (!this.push(d)) this.gunzip.pause();
+        });
+        this.gunzip.on('error', (e) => this.destroy(e));
+      }
+    }
+    if (this.gunzip) {
+      this.gunzip.write(chunk, cb);
+    } else {
+      cb(null, chunk);
+    }
+  }
+
+  _flush(cb) {
+    // A stream that ended before two bytes ever arrived: emit what was kept.
+    if (this.sniff.length > 0) {
+      this.push(this.sniff);
+      this.sniff = Buffer.alloc(0);
+    }
+    if (this.gunzip) {
+      this.gunzip.end();
+      this.gunzip.on('end', () => cb());
+    } else {
+      cb();
+    }
+  }
+
+  _read(size) {
+    super._read(size);
+    // Consumer wants more decompressed data; resume a paused gunzip. Transform
+    // ignores a bare `_read` constructor option, so a subclass override is the
+    // only reliable resume hook under downstream backpressure.
+    if (this.gunzip) this.gunzip.resume();
+  }
+}
+
+function createAutoGunzip() {
+  return new AutoGunzipStream();
 }
 
 /**
@@ -1244,6 +1256,7 @@ export {
   getSkillName,
   findSkillDir,
   listSkillsInDir,
+  createAutoGunzip,
   MAX_REDIRECTS,
   MAX_ARCHIVE_ENTRIES,
   MAX_ARCHIVE_BYTES,
