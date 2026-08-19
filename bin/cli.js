@@ -18,7 +18,7 @@ import inquirer from 'inquirer';
 import chalk from 'chalk';
 import fs from 'fs-extra';
 import path from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
+import { fileURLToPath } from 'url';
 import ora from 'ora';
 import https from 'https';
 import { createGunzip } from 'zlib';
@@ -205,13 +205,27 @@ function createByteLimitTransform(limit) {
 function createAutoGunzip() {
   let gunzip = null;
   let decided = false;
+  let sniff = Buffer.alloc(0);
   return new Transform({
     transform(chunk, _enc, cb) {
       if (!decided) {
+        // Keep buffering until at least two bytes are available so a gzip
+        // stream split across chunk boundaries is still detected.
+        sniff = sniff.length === 0 ? chunk : Buffer.concat([sniff, chunk]);
+        if (sniff.length < 2) {
+          cb();
+          return;
+        }
+        chunk = sniff;
+        sniff = Buffer.alloc(0);
         decided = true;
-        if (chunk.length >= 2 && chunk[0] === 0x1f && chunk[1] === 0x8b) {
+        if (chunk[0] === 0x1f && chunk[1] === 0x8b) {
           gunzip = createGunzip();
-          gunzip.on('data', (d) => this.push(d));
+          gunzip.on('data', (d) => {
+            // Respect readable-side backpressure: a decompression bomb must
+            // not fill our readable buffer before the byte limiter rejects it.
+            if (!this.push(d)) gunzip.pause();
+          });
           gunzip.on('error', (e) => this.destroy(e));
         }
       }
@@ -222,12 +236,21 @@ function createAutoGunzip() {
       }
     },
     flush(cb) {
+      // A stream that ended before two bytes ever arrived: emit what was kept.
+      if (sniff.length > 0) {
+        this.push(sniff);
+        sniff = Buffer.alloc(0);
+      }
       if (gunzip) {
         gunzip.end();
         gunzip.on('end', () => cb());
       } else {
         cb();
       }
+    },
+    _read() {
+      // Consumer wants more decompressed data; resume a paused gunzip.
+      if (gunzip) gunzip.resume();
     },
   });
 }
@@ -1186,10 +1209,18 @@ function printResult(successCount, totalCount) {
 // ─── Parse & Run ─────────────────────────────────────────────────────────────
 
 // Only run the CLI when executed directly, so tests can import the module
-// without triggering commander or process.exit behavior.
-const isMain =
-  process.argv[1] &&
-  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+// without triggering commander or process.exit behavior. Compare real paths:
+// npm invokes bin/cli.js through node_modules/.bin/fireskill, where argv[1]
+// is the symlink path while import.meta.url resolves to the real target.
+const isMain = (() => {
+  if (!process.argv[1]) return false;
+  const self = fileURLToPath(import.meta.url);
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(self);
+  } catch {
+    return path.resolve(process.argv[1]) === self;
+  }
+})();
 if (isMain) {
   program.parse();
 }

@@ -548,8 +548,10 @@ async function withSandboxedHome(fn) {
   try {
     return await fn(home);
   } finally {
-    process.env.HOME = prevHome;
-    process.env.USERPROFILE = prevUserProfile;
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevUserProfile;
     await fs.remove(home).catch(() => {});
   }
 }

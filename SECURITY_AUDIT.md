@@ -90,7 +90,7 @@ Reviewed all markdown for instructions that would make an agent execute unsaniti
 - `import { execSync } from 'child_process'` was unused (dead import) — removed. Dead `downloadGitHubRepo` RETRY branch in the `add` handler — removed in favor of a single clean path; the visible "Trying master branch…" UX is preserved.
 - `package.json` `repository.url` was empty — set to `git+https://github.com/idevakk/fireskill.git`.
 - No lifecycle scripts anywhere (no `preinstall`/`postinstall`); confirmed.
-- `files` ships exactly `bin/`, `skill/`, `README.md`, `LICENSE` (verified with `npm pack --dry-run`; `.agents/` and `test/` are not published).
+- `files` ships exactly `bin/`, `skill/`, `README.md`, `LICENSE`, and `package.json` (verified with `npm pack --dry-run`; `.agents/` and `test/` are not published).
 - `process.exit` replaced with `process.exitCode` so cleanup finalizers run (F5).
 - Error messages never echo the request URL (which for GitHub tarball redirects can carry a short-lived signed token) — download errors show only status codes and safe context.
 
