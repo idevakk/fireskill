@@ -641,7 +641,7 @@ test('listSkillsInDir reports only real directories (never symlinks)', async () 
 
 // ─── 8. auto-gunzip stream (`createAutoGunzip`) ──────────────────────────────
 
-async function autoGunzipOnce(input) {
+async function autoGunzipOnce(chunks) {
   const parts = [];
   const sink = new Writable({
     write(c, _enc, cb) {
@@ -649,20 +649,20 @@ async function autoGunzipOnce(input) {
       cb();
     },
   });
-  await pipeline(Readable.from([input]), createAutoGunzip(), sink);
+  await pipeline(Readable.from(chunks), createAutoGunzip(), sink);
   return Buffer.concat(parts);
 }
 
 test('auto-gunzip: gzip with a 1-byte first chunk still decompresses', async () => {
   const payload = Buffer.from('fireskill-chunked-gzip-'.repeat(500));
   const gz = gzipSync(payload);
-  const out = await autoGunzipOnce(Buffer.concat([gz.subarray(0, 1), gz.subarray(1)]));
+  const out = await autoGunzipOnce([gz.subarray(0, 1), gz.subarray(1)]);
   assert.ok(out.equals(payload), 'gzip split across the decision boundary must decompress');
 });
 
 test('auto-gunzip: plain tar with a 1-byte first chunk passes through unchanged', async () => {
   const tar = Buffer.from('plain-ustar-tar-bytes-'.repeat(200));
-  const out = await autoGunzipOnce(Buffer.concat([tar.subarray(0, 1), tar.subarray(1)]));
+  const out = await autoGunzipOnce([tar.subarray(0, 1), tar.subarray(1)]);
   assert.ok(out.equals(tar), 'plain tar must pass through untouched');
 });
 
