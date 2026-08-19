@@ -68,6 +68,23 @@ The `add` command:
 4. Copies it to the correct location for your chosen agent(s)
 
 > **Private repos**: Set `GITHUB_TOKEN` or `GH_TOKEN` environment variable.
+>
+> **Security**: repositories are downloaded over HTTPS from GitHub-owned hosts
+> only (`github.com`, `api.github.com`, `codeload.github.com`, `objects.githubusercontent.com`,
+> `raw.githubusercontent.com`); the token is never sent anywhere else. Archives
+> are extracted with strict path-traversal protection (absolute paths, `..`
+> entries, escaping symlinks and self- or ancestor-referencing symlinks abort
+> the download), extraction runs under a hard 10-minute deadline so a hostile
+> archive can never hang the CLI, extracted symlinks are dereferenced so
+> installed skills never contain links, and temp directories are unique,
+> mode `0700` and cleaned up on every failure path.
+
+#### Skill names
+
+Skill names come from the `SKILL.md` frontmatter `name` field (or `--name`),
+normalized to lowercase letters, digits, `-` and `_`. Names that are empty,
+longer than 100 characters, or reserved on Windows (e.g. `con`, `nul`) are
+rejected — use `--name` to provide a valid one.
 
 ---
 
